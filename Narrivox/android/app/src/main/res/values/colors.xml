@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="colorPrimary">#14110e</color>
+    <color name="colorPrimaryDark">#14110e</color>
+    <color name="colorAccent">#e39a3c</color>
+    <color name="night">#14110e</color>
+    <color name="raised">#1c1814</color>
+    <color name="surface">#2a241e</color>
+    <color name="paper">#f6efe6</color>
+    <color name="muted">#cbbfaf</color>
+    <color name="gold">#e39a3c</color>
+    <color name="ink">#1c1308</color>
+    <color name="line">#3a332c</color>
+</resources>

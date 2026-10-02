@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Narrivox">
+  <rect width="32" height="32" rx="7" fill="#14110e"/>
+  <path d="M6 7h20l-3.4 11.5H9.4z" fill="#f6efe6"/>
+  <rect x="14.4" y="18.5" width="3.2" height="5.5" fill="#e39a3c"/>
+  <rect x="8" y="24" width="16" height="3.6" rx="1.5" fill="#e39a3c"/>
+</svg>

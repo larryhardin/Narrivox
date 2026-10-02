@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.vercel/
+.grok/
+artifacts/
+screenshots/
+attachments/
+*.apk
+*.idsig
+
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/*.jks
+android/app/keystore.properties
