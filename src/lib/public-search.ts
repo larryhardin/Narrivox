@@ -1,6 +1,8 @@
 import { BOOKS, type CatalogBook, type CatalogChapter } from "@/lib/catalog";
+import { persistConfig } from "@/lib/app-vault";
 
 const KEY = "nightstand-public-books";
+const HIDDEN = "nightstand-hidden-books";
 const ARCHIVE = "https://archive.org";
 
 export type PublicHit = {
@@ -51,6 +53,35 @@ export function listPublicBooks(): CatalogBook[] {
 export function savePublicBook(book: CatalogBook) {
   const next = [book, ...listPublicBooks().filter((item) => item.id !== book.id)].slice(0, 24);
   localStorage.setItem(KEY, JSON.stringify(next));
+  showShelfBook(book.id);
+  persistConfig();
+}
+
+export function hiddenBookIds(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN) ?? "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((item) => typeof item === "string");
+  } catch {
+    return [];
+  }
+}
+
+export function hideShelfBook(id: string) {
+  const next = [id, ...hiddenBookIds().filter((item) => item !== id)];
+  localStorage.setItem(HIDDEN, JSON.stringify(next));
+  localStorage.setItem(
+    KEY,
+    JSON.stringify(listPublicBooks().filter((book) => book.id !== id)),
+  );
+  persistConfig();
+}
+
+export function showShelfBook(id: string) {
+  const next = hiddenBookIds().filter((item) => item !== id);
+  if (next.length === hiddenBookIds().length) return;
+  localStorage.setItem(HIDDEN, JSON.stringify(next));
+  persistConfig();
 }
 
 export function findCatalogBook(id: string): CatalogBook | undefined {

@@ -1,6 +1,83 @@
 import { useEffect, useRef } from "react";
-import { registerAudio } from "@/lib/audio-bus";
+import { getAudio, markUserPause, registerAudio, takeUserPause } from "@/lib/audio-bus";
 import { usePlayer } from "@/lib/player-store";
+
+type NativePlayback = {
+  setPlaying?: (on: boolean) => void;
+  updatePlayback?: (
+    title: string,
+    artist: string,
+    chapter: string,
+    playing: boolean,
+    positionMs: number,
+    durationMs: number,
+    cover: string,
+  ) => void;
+};
+
+let lastNativePush = 0;
+let lastControlAt = 0;
+let lastControl = "";
+
+function runRemoteControl(action: string) {
+  const now = Date.now();
+  const toggle = action === "play" || action === "pause";
+  const lastToggle = lastControl === "play" || lastControl === "pause";
+  if (now - lastControlAt < 400 && (action === lastControl || (toggle && lastToggle))) return;
+  lastControl = action;
+  lastControlAt = now;
+  const audio = getAudio();
+  const store = usePlayer.getState();
+  if (action === "play") {
+    if (!store.playing) void store.toggle();
+    return;
+  }
+  if (action === "pause") {
+    markUserPause();
+    audio?.pause();
+    return;
+  }
+  if (action === "back") store.skip(-15);
+  if (action === "forward") store.skip(30);
+}
+
+function syncNativePlayback() {
+  const native = (window as unknown as { NightstandNative?: NativePlayback }).NightstandNative;
+  if (!native) return;
+  const state = usePlayer.getState();
+  const active = state.active;
+  try {
+    if (!native.updatePlayback) {
+      native.setPlaying?.(Boolean(active) && state.playing);
+      return;
+    }
+    if (!active) {
+      native.updatePlayback("", "", "", false, 0, 0, "");
+      return;
+    }
+    const chapter = active.chapters.find((item) => item.id === active.chapterId);
+    const rawCover = active.cover ?? "";
+    const cover =
+      rawCover.startsWith("/") || rawCover.startsWith("http://") || rawCover.startsWith("https://")
+        ? rawCover
+        : "";
+    const ended = getAudio()?.ended === true;
+    let durationMs = Math.max(0, Math.round((Number.isFinite(state.duration) ? state.duration : 0) * 1000));
+    let positionMs = Math.max(0, Math.round(state.currentTime * 1000));
+    if (durationMs > 0 && positionMs >= durationMs) positionMs = durationMs - 1;
+    native.updatePlayback(
+      active.title,
+      active.author,
+      chapter?.title ?? "",
+      state.playing && !ended,
+      positionMs,
+      durationMs,
+      cover,
+    );
+  } catch {
+    // The Android shell is the only place this bridge exists.
+  }
+}
 
 export function AudioEngine() {
   const ref = useRef<HTMLAudioElement>(null);
@@ -21,10 +98,15 @@ export function AudioEngine() {
     audio.preservesPitch = true;
     audio.volume = usePlayer.getState().volume;
     audio.playbackRate = usePlayer.getState().rate;
+    let bounces = 0;
+    const lockWindow = window as unknown as { __narrivoxLock?: (action: string) => void };
+    lockWindow.__narrivoxLock = runRemoteControl;
 
     const onTime = () => {
+      if (audio.ended) return;
+      if (audio.currentTime > 1) bounces = 0;
       usePlayer.getState().setClock(audio.currentTime, audio.duration);
-      if ("mediaSession" in navigator && Number.isFinite(audio.duration) && audio.duration > 0) {
+      if ("mediaSession" in navigator && !("NightstandNative" in window) && Number.isFinite(audio.duration) && audio.duration > 0) {
         try {
           navigator.mediaSession.setPositionState({
             duration: audio.duration,
@@ -35,12 +117,35 @@ export function AudioEngine() {
           // Ignore browsers that reject position state mid-load.
         }
       }
+      const now = Date.now();
+      if (now - lastNativePush > 1000) {
+        lastNativePush = now;
+        syncNativePlayback();
+      }
     };
     const onPlay = () => usePlayer.getState().setPlaying(true);
-    const onPause = () => usePlayer.getState().setPlaying(false);
+    const onPause = () => {
+      if (takeUserPause()) {
+        bounces = 0;
+        usePlayer.getState().setPlaying(false);
+        return;
+      }
+      // Android can pause the page once when the lock-screen session appears.
+      if (!audio.ended && audio.currentTime < 0.5 && bounces < 1 && usePlayer.getState().playing) {
+        bounces += 1;
+        void audio.play();
+        return;
+      }
+      bounces = 0;
+      usePlayer.getState().setPlaying(false);
+    };
     const onWaiting = () => usePlayer.getState().setBuffering(true);
     const onReady = () => usePlayer.getState().setBuffering(false);
     const onEnded = () => {
+      const duration = audio.duration;
+      const finished =
+        Number.isFinite(duration) && duration > 1 && audio.currentTime >= duration - 1.25;
+      if (!finished) return;
       const sleep = usePlayer.getState().sleep;
       usePlayer.getState().markChapterDone();
       if (sleep.mode === "chapter") {
@@ -48,12 +153,19 @@ export function AudioEngine() {
         usePlayer.getState().setPlaying(false);
         return;
       }
-      void usePlayer.getState().stepChapter(1).then((moved) => {
-        if (!moved) usePlayer.getState().setPlaying(false);
-      });
+      // Leave the ended event before loading the next file. Doing it inline
+      // crashes the Android WebView at the end of every chapter.
+      window.setTimeout(() => {
+        const still = getAudio();
+        if (!still || !still.ended) return;
+        void usePlayer.getState().stepChapter(1).then((moved) => {
+          if (!moved) usePlayer.getState().setPlaying(false);
+        });
+      }, 0);
     };
     const onError = () => {
       if (!audio.getAttribute("src") && !audio.src) return;
+      if (audio.error?.code === MediaError.MEDIA_ERR_ABORTED) return;
       usePlayer.getState().setError("This chapter couldn't be played.");
       usePlayer.getState().setBuffering(false);
       usePlayer.getState().setPlaying(false);
@@ -85,6 +197,7 @@ export function AudioEngine() {
     const timer = window.setInterval(() => {
       const sleep = usePlayer.getState().sleep;
       if (sleep.mode === "minutes" && Date.now() >= sleep.endsAt) {
+        markUserPause();
         audio.pause();
         usePlayer.getState().clearSleep();
       }
@@ -93,6 +206,7 @@ export function AudioEngine() {
     return () => {
       window.clearInterval(timer);
       unsubscribe();
+      markUserPause();
       audio.pause();
       audio.removeEventListener("timeupdate", onTime);
       audio.removeEventListener("play", onPlay);
@@ -103,31 +217,39 @@ export function AudioEngine() {
       audio.removeEventListener("ended", onEnded);
       audio.removeEventListener("error", onError);
       registerAudio(null);
+      delete lockWindow.__narrivoxLock;
     };
   }, []);
 
   useEffect(() => {
     if (!title) {
       document.title = "Narrivox";
+      syncNativePlayback();
       return;
     }
     document.title = chapterTitle ? `${chapterTitle} — ${title}` : title;
-    if (!("mediaSession" in navigator)) return;
-    const artwork = cover
-      ? [
-          {
-            src: new URL(cover, window.location.origin).href,
-            sizes: "1152x1728",
-            type: "image/jpeg",
-          },
-        ]
-      : [];
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: chapterTitle || title,
-      artist: author,
-      album: title,
-      artwork,
-    });
+    if (!("mediaSession" in navigator)) {
+      syncNativePlayback();
+      return;
+    }
+    const nativeControls = "NightstandNative" in window;
+    if (!nativeControls) {
+      const artwork = cover
+        ? [
+            {
+              src: new URL(cover, window.location.origin).href,
+              sizes: "1152x1728",
+              type: "image/jpeg",
+            },
+          ]
+        : [];
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: chapterTitle || title,
+        artist: author,
+        album: title,
+        artwork,
+      });
+    }
     const bind = (name: MediaSessionAction, action: () => void) => {
       try {
         navigator.mediaSession.setActionHandler(name, action);
@@ -135,28 +257,20 @@ export function AudioEngine() {
         // This action is not supported here.
       }
     };
-    bind("play", () => void usePlayer.getState().toggle());
-    bind("pause", () => ref.current?.pause());
-    bind("previoustrack", () => void usePlayer.getState().stepChapter(-1));
-    bind("nexttrack", () => void usePlayer.getState().stepChapter(1));
-    bind("seekbackward", () => usePlayer.getState().skip(-15));
-    bind("seekforward", () => usePlayer.getState().skip(30));
+    bind("play", () => runRemoteControl("play"));
+    bind("pause", () => runRemoteControl("pause"));
+    bind("previoustrack", () => runRemoteControl("back"));
+    bind("nexttrack", () => runRemoteControl("forward"));
+    bind("seekbackward", () => runRemoteControl("back"));
+    bind("seekforward", () => runRemoteControl("forward"));
+    syncNativePlayback();
   }, [author, chapterTitle, cover, title]);
 
   useEffect(() => {
-    if ("mediaSession" in navigator) {
+    if ("mediaSession" in navigator && !("NightstandNative" in window)) {
       navigator.mediaSession.playbackState = playing ? "playing" : "paused";
     }
-    const native = (
-      window as unknown as {
-        NightstandNative?: { setPlaying: (on: boolean) => void };
-      }
-    ).NightstandNative;
-    try {
-      native?.setPlaying(playing);
-    } catch {
-      // The Android shell is the only place this bridge exists.
-    }
+    syncNativePlayback();
   }, [playing]);
 
   return <audio ref={ref} preload="none" className="sr-only" />;

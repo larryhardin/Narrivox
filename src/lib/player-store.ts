@@ -1,6 +1,7 @@
 import { create } from "zustand";
-import { getAudio } from "@/lib/audio-bus";
-import { getAudioUrl, optionalAudioUrl, peekAudioUrl } from "@/lib/library-db";
+import { persistConfig } from "@/lib/app-vault";
+import { getAudio, markUserPause } from "@/lib/audio-bus";
+import { getAudioUrl, optionalAudioUrl, peekAudioUrl, prepareDurableLibrary } from "@/lib/library-db";
 import type {
   ActiveBook,
   Bookmark,
@@ -67,6 +68,8 @@ type PlayerState = {
 };
 
 let loadToken = 0;
+let rewindToken = 0;
+let sourceLoading = false;
 
 function isRate(value: unknown): value is Rate {
   return typeof value === "number" && (RATES as readonly number[]).includes(value);
@@ -82,6 +85,7 @@ function writeStorage(state: PlayerState) {
     volume: state.volume,
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  persistConfig();
 }
 
 function isProgress(value: unknown): value is ProgressEntry {
@@ -110,6 +114,7 @@ async function loadSource(
   const audio = getAudio();
   if (!audio) return;
   const token = ++loadToken;
+  sourceLoading = true;
   const store = usePlayer.getState();
   store.setError(null);
   usePlayer.getState().setBuffering(true);
@@ -125,7 +130,9 @@ async function loadSource(
     const seekTo = () => {
       if (token !== loadToken) return;
       const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
-      const nextTime = Math.min(Math.max(0, time), duration > 0.4 ? duration - 0.2 : Math.max(0, time));
+      let nextTime = Math.max(0, time);
+      if (duration > 1 && nextTime >= duration - 0.75) nextTime = 0;
+      else if (duration > 0.4) nextTime = Math.min(nextTime, duration - 0.2);
       if (duration > 0 && Math.abs(audio.currentTime - nextTime) > 0.3) audio.currentTime = nextTime;
       usePlayer.getState().setClock(audio.currentTime || nextTime, audio.duration);
     };
@@ -146,6 +153,8 @@ async function loadSource(
       return;
     }
     usePlayer.getState().setError("This chapter couldn't be played.");
+  } finally {
+    if (token === loadToken) sourceLoading = false;
   }
 }
 
@@ -181,10 +190,13 @@ export const usePlayer = create<PlayerState>((set, get) => ({
   closePlayer: () => set({ screen: get().returnTo === "book" ? "book" : "shelf" }),
 
   play: async (book, chapterId, autoplay, at) => {
-    const chapter = book.chapters.find((item) => item.id === chapterId) ?? book.chapters[0];
+    let chapter = book.chapters.find((item) => item.id === chapterId) ?? book.chapters[0];
     if (!chapter) return;
     const previous = get().progress[book.id];
-    const time = at ?? previous?.times[chapter.id] ?? 0;
+    const known = get().durations[`${book.id}:${chapter.id}`] ?? 0;
+    let time = at ?? previous?.times[chapter.id] ?? 0;
+    // A save parked on the last instant used to end the chapter immediately.
+    if (at == null && known > 1 && time >= known - 0.75) time = 0;
     const active: ActiveBook = {
       bookId: book.id,
       title: book.title,
@@ -240,6 +252,7 @@ export const usePlayer = create<PlayerState>((set, get) => ({
       }
       return;
     }
+    markUserPause();
     audio.pause();
   },
 
@@ -258,6 +271,10 @@ export const usePlayer = create<PlayerState>((set, get) => ({
   skip: (delta) => {
     const audio = getAudio();
     const base = audio ? audio.currentTime : get().currentTime;
+    if (delta < 0 && base + delta < -0.05) {
+      void rewindChapters(-delta);
+      return;
+    }
     const duration = audio && Number.isFinite(audio.duration) ? audio.duration : Infinity;
     const next = Math.min(Math.max(0, base + delta), duration === Infinity ? base + delta : Math.max(0, duration));
     if (audio) audio.currentTime = next;
@@ -272,7 +289,9 @@ export const usePlayer = create<PlayerState>((set, get) => ({
     const chapter = active.chapters[index + dir];
     if (!chapter) return false;
     const entry = get().progress[active.bookId];
-    const time = entry?.times[chapter.id] ?? 0;
+    const known = get().durations[`${active.bookId}:${chapter.id}`] ?? 0;
+    let time = entry?.times[chapter.id] ?? 0;
+    if (known > 1 && time >= known - 0.75) time = 0;
     const nextActive: ActiveBook = { ...active, chapterId: chapter.id };
     const progress = {
       ...get().progress,
@@ -364,6 +383,7 @@ export const usePlayer = create<PlayerState>((set, get) => ({
     const clearing = get().active?.bookId === bookId;
     if (clearing) {
       loadToken += 1;
+      markUserPause();
       getAudio()?.pause();
     }
     set({
@@ -385,6 +405,9 @@ export const usePlayer = create<PlayerState>((set, get) => ({
   },
 
   setClock: (time, duration) => {
+    if (sourceLoading) return;
+    const audio = getAudio();
+    if (audio?.ended) return;
     const nextDuration = Number.isFinite(duration) ? duration : 0;
     const previous = get().currentTime;
     set({ currentTime: time, duration: nextDuration });
@@ -434,13 +457,17 @@ export const usePlayer = create<PlayerState>((set, get) => ({
 function commitTime(time: number) {
   const active = usePlayer.getState().active;
   if (!active) return;
-  const entry = usePlayer.getState().progress[active.bookId] ?? blankEntry(active.chapterId);
+  stampChapterTime(active.bookId, active.chapterId, time);
+}
+
+function stampChapterTime(bookId: string, chapterId: string, time: number) {
+  const state = usePlayer.getState();
+  const entry = state.progress[bookId] ?? blankEntry(chapterId);
   const progress = {
-    ...usePlayer.getState().progress,
-    [active.bookId]: {
+    ...state.progress,
+    [bookId]: {
       ...entry,
-      chapterId: active.chapterId,
-      times: { ...entry.times, [active.chapterId]: time },
+      times: { ...entry.times, [chapterId]: time },
       updatedAt: Date.now(),
     },
   };
@@ -448,7 +475,133 @@ function commitTime(time: number) {
   writeStorage(usePlayer.getState());
 }
 
+async function chapterSource(book: ActiveBook, chapter: Chapter) {
+  const local = peekAudioUrl(book.bookId, chapter.id) ?? (await optionalAudioUrl(book.bookId, chapter.id));
+  return local ?? chapter.src ?? (await getAudioUrl(book.bookId, chapter.id));
+}
+
+async function probeDuration(book: ActiveBook, chapter: Chapter) {
+  const known = usePlayer.getState().durations[`${book.bookId}:${chapter.id}`];
+  if (known && known > 0.3) return known;
+  const src = await chapterSource(book, chapter);
+  const duration = await new Promise<number>((resolve) => {
+    const probe = new Audio();
+    probe.preload = "metadata";
+    const finish = (value: number) => {
+      probe.removeAttribute("src");
+      probe.load();
+      resolve(value);
+    };
+    probe.addEventListener(
+      "loadedmetadata",
+      () => finish(Number.isFinite(probe.duration) ? probe.duration : 0),
+      { once: true },
+    );
+    probe.addEventListener("error", () => finish(0), { once: true });
+    probe.src = src;
+  });
+  if (duration > 0.3) usePlayer.getState().rememberDuration(book.bookId, chapter.id, duration);
+  return duration;
+}
+
+async function rewindChapters(seconds: number) {
+  const token = ++rewindToken;
+  const audio = getAudio();
+  const active = usePlayer.getState().active;
+  if (!active) return;
+  const base = audio ? audio.currentTime : usePlayer.getState().currentTime;
+  const autoplay = audio ? !audio.paused : usePlayer.getState().playing;
+  let index = active.chapters.findIndex((chapter) => chapter.id === active.chapterId);
+  if (index <= 0) {
+    if (audio) audio.currentTime = 0;
+    usePlayer.setState({ currentTime: 0 });
+    commitTime(0);
+    return;
+  }
+  stampChapterTime(active.bookId, active.chapterId, 0);
+  let leftover = seconds - Math.max(0, base);
+  while (index > 0 && token === rewindToken) {
+    index -= 1;
+    const chapter = active.chapters[index];
+    if (!chapter) return;
+    let duration = 0;
+    try {
+      duration = await probeDuration(active, chapter);
+    } catch {
+      duration = 0;
+    }
+    if (token !== rewindToken) return;
+    if (duration <= 0) {
+      const nextActive: ActiveBook = { ...active, chapterId: chapter.id };
+      usePlayer.setState({
+        active: nextActive,
+        currentTime: 0,
+        duration: 0,
+        error: null,
+      });
+      await loadSource(nextActive, chapter, 0, autoplay);
+      return;
+    }
+    if (duration >= leftover) {
+      const at = duration - leftover;
+      const nextActive: ActiveBook = { ...active, chapterId: chapter.id };
+      const entry = usePlayer.getState().progress[active.bookId];
+      usePlayer.setState({
+        active: nextActive,
+        progress: {
+          ...usePlayer.getState().progress,
+          [active.bookId]: {
+            chapterId: chapter.id,
+            times: { ...(entry?.times ?? {}), [chapter.id]: at },
+            done: entry?.done ?? [],
+            finished: false,
+            updatedAt: Date.now(),
+          },
+        },
+        currentTime: at,
+        duration,
+        error: null,
+      });
+      writeStorage(usePlayer.getState());
+      await loadSource(nextActive, chapter, at, autoplay);
+      return;
+    }
+    stampChapterTime(active.bookId, chapter.id, 0);
+    leftover -= duration;
+  }
+  const first = active.chapters[0];
+  if (!first || token !== rewindToken) return;
+  const nextActive: ActiveBook = { ...active, chapterId: first.id };
+  const entry = usePlayer.getState().progress[active.bookId];
+  usePlayer.setState({
+    active: nextActive,
+    progress: {
+      ...usePlayer.getState().progress,
+      [active.bookId]: {
+        chapterId: first.id,
+        times: { ...(entry?.times ?? {}), [first.id]: 0 },
+        done: entry?.done ?? [],
+        finished: false,
+        updatedAt: Date.now(),
+      },
+    },
+    currentTime: 0,
+    duration: usePlayer.getState().durations[`${active.bookId}:${first.id}`] ?? 0,
+    error: null,
+  });
+  writeStorage(usePlayer.getState());
+  await loadSource(nextActive, first, 0, autoplay);
+}
+
 export function hydratePlayer() {
+  if (usePlayer.getState().hydrated) return;
+  void prepareDurableLibrary().then(() => {
+    if (usePlayer.getState().hydrated) return;
+    applyHydratedPlayer();
+  });
+}
+
+function applyHydratedPlayer() {
   if (usePlayer.getState().hydrated) return;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);

@@ -25,6 +25,7 @@ const EMPTY: DownloadStatus = {
 const status = new Map<string, DownloadStatus>();
 const listeners = new Map<string, Set<() => void>>();
 const running = new Set<string>();
+const cancelled = new Set<string>();
 
 function publish(bookId: string, next: DownloadStatus) {
   status.set(bookId, next);
@@ -100,9 +101,16 @@ export async function refreshSaved(bookId: string) {
       total: catalogBytes(bookId),
       chapter: book.chapters.length,
       chapters: book.chapters.length,
-      message: "Full recording saved on this device.",
+      message: "Full recording saved.",
     });
   }
+}
+
+export function cancelDownload(bookId: string) {
+  cancelled.add(bookId);
+  running.delete(bookId);
+  status.delete(bookId);
+  listeners.get(bookId)?.forEach((listener) => listener());
 }
 
 export function startFullDownload(bookId: string) {
@@ -112,6 +120,7 @@ export function startFullDownload(bookId: string) {
 }
 
 async function runDownload(book: CatalogBook) {
+  cancelled.delete(book.id);
   running.add(book.id);
   const total = totalBytes(book);
   try {
@@ -129,6 +138,7 @@ async function runDownload(book: CatalogBook) {
     });
     let index = 0;
     for (const chapter of book.chapters) {
+      if (cancelled.has(book.id)) return;
       index += 1;
       if (saved.has(chapter.id)) continue;
       const base = received;
@@ -154,7 +164,7 @@ async function runDownload(book: CatalogBook) {
       total: received,
       chapter: book.chapters.length,
       chapters: book.chapters.length,
-      message: "Full recording saved on this device.",
+      message: "Full recording saved.",
     });
   } catch (error) {
     publish(book.id, {

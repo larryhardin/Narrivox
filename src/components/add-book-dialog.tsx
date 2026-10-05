@@ -2,9 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { ChevronDown, ChevronUp, Plus, X } from "lucide-react";
 import { CoverArt } from "@/components/cover";
+import { pushBackLayer } from "@/lib/back-stack";
 import { readAudioTags, titleFromFilename } from "@/lib/audio-tags";
 import { searchBookMeta, type BookHit } from "@/lib/book-meta";
+import { chapterTitleFor, orderFolderAudio } from "@/lib/folder-import";
 import { saveUserBook } from "@/lib/library-db";
+import { directAudioFromInput, folderPickerKind, pickBookFolder } from "@/lib/pick-book-folder";
 import type { UserBook } from "@/lib/types";
 
 const AUDIO_NAME = /\.(mp3|m4a|aac|wav|ogg|flac|mpeg|mp4|webm|m4b)$/i;
@@ -71,7 +74,19 @@ export function AddBookDialog({
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [importing, setImporting] = useState(false);
   const heldQuery = useRef("");
+  const folderInput = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    return pushBackLayer(() => onOpenChange(false));
+  }, [open, onOpenChange]);
+
+  useEffect(() => {
+    if (!open || hits.length === 0) return;
+    return pushBackLayer(() => setHits([]));
+  }, [open, hits.length]);
 
   function reset() {
     setTitle("");
@@ -86,6 +101,7 @@ export function AddBookDialog({
     setNote("");
     setError(null);
     setSaving(false);
+    setImporting(false);
     heldQuery.current = "";
   }
 
@@ -163,6 +179,54 @@ export function AddBookDialog({
     setNote(`Using ${hit.source}.`);
   }
 
+  function chapterLabel(file: File, index: number) {
+    return chapterTitleFor(file.name) || prettyName(file.name, index);
+  }
+
+  function useFolder(folderName: string, audio: File[]) {
+    const ordered = orderFolderAudio(folderName, audio.map((file) => file.name));
+    if (!ordered.ok) {
+      setError(ordered.error);
+      setNote("");
+      return;
+    }
+    heldQuery.current = "";
+    setTitle(ordered.title);
+    setAuthor(ordered.author);
+    setFiles(ordered.chapters.map((chapter) => audio[chapter.position]!));
+    setError(null);
+    setNote(
+      ordered.chapters.length === 1
+        ? "1 chapter from this folder."
+        : `${ordered.chapters.length} chapters from this folder, in order.`,
+    );
+  }
+
+  async function chooseFolder() {
+    if (folderPickerKind() === "input") {
+      folderInput.current?.click();
+      return;
+    }
+    setError(null);
+    setImporting(true);
+    try {
+      const picked = await pickBookFolder(setNote);
+      if (!picked.ok) {
+        if (picked.useInput) {
+          folderInput.current?.click();
+          return;
+        }
+        if (!picked.cancelled && picked.error) setError(picked.error);
+        return;
+      }
+      useFolder(picked.folderName || "Audiobook", picked.files);
+    } catch {
+      setError("That folder couldn't be read.");
+    } finally {
+      setImporting(false);
+    }
+  }
+
   function move(index: number, dir: -1 | 1) {
     setFiles((current) => {
       const next = current.slice();
@@ -197,7 +261,7 @@ export function AddBookDialog({
       createdAt: Date.now(),
       chapters: files.map((file, index) => ({
         id: crypto.randomUUID(),
-        title: prettyName(file.name, index),
+        title: chapterLabel(file, index),
       })),
     };
     try {
@@ -209,7 +273,7 @@ export function AddBookDialog({
       onOpenChange(false);
       onSaved();
     } catch {
-      setError("That book couldn't be saved on this device.");
+      setError("That book couldn't be saved.");
       setSaving(false);
     }
   }
@@ -232,7 +296,7 @@ export function AddBookDialog({
             </Dialog.Close>
           </div>
           <Dialog.Description className="mt-2 text-sm text-muted">
-            The audio stays on this device. Only the title is looked up, on Audible and other public catalogs.
+            Audio is saved in the place you chose in Settings. Choose a folder when the audio files inside it are the chapters of one book. The title is looked up on Audible and other public catalogs.
           </Dialog.Description>
           {cover && (
             <div className="mt-4 flex items-center gap-3">
@@ -288,25 +352,68 @@ export function AddBookDialog({
             onChange={(event) => setAuthor(event.target.value)}
             autoComplete="off"
           />
-          <label className="btn btn-quiet mt-4 cursor-pointer">
-            <Plus className="h-4 w-4" />
-            Choose audio
-            <input
-              type="file"
-              accept="audio/*,.mp3,.m4a,.m4b,.aac,.wav,.ogg,.flac"
-              multiple
-              className="sr-only"
-              onChange={(event) => {
-                const picked = Array.from(event.target.files ?? []);
-                const accepted = picked.filter(isAudio);
-                if (accepted.length !== picked.length) {
-                  setError("Skipped a file that didn't look like audio.");
+          <div className="mt-4 flex flex-wrap gap-2">
+            <label className="btn btn-quiet cursor-pointer">
+              <Plus className="h-4 w-4" />
+              Choose audio
+              <input
+                type="file"
+                accept="audio/*,.mp3,.m4a,.m4b,.aac,.wav,.ogg,.flac"
+                multiple
+                className="sr-only"
+                onChange={(event) => {
+                  const picked = Array.from(event.target.files ?? []);
+                  const accepted = picked.filter(isAudio);
+                  if (accepted.length !== picked.length) {
+                    setError("Skipped a file that didn't look like audio.");
+                  }
+                  setFiles((current) => [...current, ...accepted]);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+            <label
+              className={`btn btn-quiet cursor-pointer ${importing || saving ? "pointer-events-none opacity-60" : ""}`}
+              onClick={(event) => {
+                if (importing || saving) {
+                  event.preventDefault();
+                  return;
                 }
-                setFiles((current) => [...current, ...accepted]);
-                event.target.value = "";
+                if (folderPickerKind() !== "input") {
+                  event.preventDefault();
+                  void chooseFolder();
+                }
               }}
-            />
-          </label>
+            >
+              <Plus className="h-4 w-4" />
+              {importing ? "Reading folder…" : "Choose a folder"}
+              <input
+                type="file"
+                multiple
+                className="sr-only"
+                tabIndex={-1}
+                ref={(node) => {
+                  folderInput.current = node;
+                  node?.setAttribute("webkitdirectory", "");
+                  node?.setAttribute("directory", "");
+                }}
+                onChange={(event) => {
+                  const picked = Array.from(event.target.files ?? []);
+                  event.target.value = "";
+                  const direct = directAudioFromInput(picked);
+                  if (!direct.folderName || direct.files.length === 0) {
+                    setError(
+                      direct.folderName
+                        ? "This folder has no audio files."
+                        : "That folder couldn't be read.",
+                    );
+                    return;
+                  }
+                  useFolder(direct.folderName, direct.files);
+                }}
+              />
+            </label>
+          </div>
           {note && <p className="mt-3 text-sm text-muted">{note}</p>}
           {files.length > 0 && (
             <ol className="mt-3 flex flex-col gap-2">
@@ -316,7 +423,7 @@ export function AddBookDialog({
                   className="flex items-center gap-2 rounded-md bg-surface px-2 py-1"
                 >
                   <span className="w-5 shrink-0 text-sm tabular-nums text-muted">{index + 1}</span>
-                  <span className="min-w-0 flex-1 truncate text-sm">{prettyName(file.name, index)}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm">{chapterLabel(file, index)}</span>
                   <button
                     type="button"
                     className="icon-btn"
@@ -353,7 +460,7 @@ export function AddBookDialog({
             </p>
           )}
           <button type="button" className="btn btn-primary mt-5 w-full" disabled={saving} onClick={() => void save()}>
-            {saving ? "Saving…" : "Save to this device"}
+            {saving ? "Saving…" : "Save book"}
           </button>
         </Dialog.Content>
       </Dialog.Portal>

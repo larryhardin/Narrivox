@@ -1,5 +1,5 @@
 import { BOOKS, type CatalogBook } from "@/lib/catalog";
-import { findCatalogBook, listPublicBooks } from "@/lib/public-search";
+import { findCatalogBook, hiddenBookIds, listPublicBooks } from "@/lib/public-search";
 import type { ProgressEntry, ShelfBook, UserBook } from "@/lib/types";
 
 export function fromCatalog(book: CatalogBook): ShelfBook {
@@ -38,8 +38,9 @@ export function fromUser(book: UserBook): ShelfBook {
 }
 
 export function libraryShelf(): ShelfBook[] {
+  const hidden = new Set(hiddenBookIds());
   const saved = listPublicBooks().filter((book) => !BOOKS.some((item) => item.id === book.id));
-  return [...BOOKS, ...saved].map(fromCatalog);
+  return [...BOOKS, ...saved].filter((book) => !hidden.has(book.id)).map(fromCatalog);
 }
 
 export function findShelf(id: string, userBooks: UserBook[]): ShelfBook | null {

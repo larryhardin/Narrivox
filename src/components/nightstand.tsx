@@ -10,6 +10,7 @@ import {
   Play,
   Plus,
   Search,
+  Settings,
   SkipBack,
   SkipForward,
   Timer,
@@ -20,9 +21,13 @@ import {
 import { AudioEngine } from "@/components/audio-engine";
 import { AddBookDialog } from "@/components/add-book-dialog";
 import { CoverArt } from "@/components/cover";
+import { SettingsScreen, StorageBanner } from "@/components/settings-screen";
+import { installAndroidBack } from "@/lib/android-back";
+import { pushBackLayer } from "@/lib/back-stack";
 import { BOOKS } from "@/lib/catalog";
 import { formatRate, formatTime } from "@/lib/format";
 import {
+  cancelDownload,
   catalogBytes,
   formatBytes,
   getDownloadStatus,
@@ -30,9 +35,9 @@ import {
   startFullDownload,
   subscribeDownload,
 } from "@/lib/full-book";
-import { deleteUserBook, listUserBooks } from "@/lib/library-db";
+import { deleteStoredAudio, deleteUserBook, listUserBooks } from "@/lib/library-db";
 import { hydratePlayer, RATES, usePlayer } from "@/lib/player-store";
-import { loadPublicRecording, savePublicBook, searchPublicDomain } from "@/lib/public-search";
+import { loadPublicRecording, savePublicBook, searchPublicDomain, hideShelfBook } from "@/lib/public-search";
 import { findShelf, fromUser, libraryShelf, listenedFraction } from "@/lib/shelf";
 
 function PlayPauseIcon({ playing }) {
@@ -94,6 +99,18 @@ export function Narrivox() {
   const hasActive = usePlayer((state) => state.active !== null);
   const { books, refresh } = useUserBooks();
   const [adding, setAdding] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const removeFromLibrary = async (book) => {
+    cancelDownload(book.id);
+    const owned = books.find((item) => item.id === book.id);
+    if (owned) await deleteUserBook(owned);
+    else await deleteStoredAudio(book.id);
+    if (book.source === "library") hideShelfBook(book.id);
+    usePlayer.getState().forgetBook(book.id);
+    usePlayer.getState().closeBook();
+    await refresh();
+  };
+  useEffect(() => installAndroidBack(), []);
   useEffect(() => {
     hydratePlayer();
     for (const book of BOOKS)
@@ -148,21 +165,26 @@ export function Narrivox() {
       /* @__PURE__ */ jsxs("div", {
         className: hasActive && screen !== "now" ? "pb-28" : void 0,
         children: [
-          screen === "shelf" &&
-            /* @__PURE__ */ jsx(Shelf, {
-              userBooks: books,
-              onAdd: () => setAdding(true),
-            }),
-          screen === "book" &&
+          settingsOpen
+            ? /* @__PURE__ */ jsx(SettingsScreen, {
+                onClose: () => setSettingsOpen(false),
+                onChanged: () => void refresh(),
+              })
+            : screen === "shelf" &&
+              /* @__PURE__ */ jsx(Shelf, {
+                userBooks: books,
+                onAdd: () => setAdding(true),
+                onSettings: () => setSettingsOpen(true),
+                onLibraryChanged: () => void refresh(),
+                onRemove: (book) => removeFromLibrary(book),
+              }),
+          !settingsOpen &&
+            screen === "book" &&
             /* @__PURE__ */ jsx(BookScreen, {
               userBooks: books,
-              onRemove: async (book) => {
-                usePlayer.getState().forgetBook(book.id);
-                await deleteUserBook(book);
-                await refresh();
-              },
+              onRemove: (book) => removeFromLibrary(book),
             }),
-          screen === "now" && /* @__PURE__ */ jsx(NowPlaying, {}),
+          !settingsOpen && screen === "now" && /* @__PURE__ */ jsx(NowPlaying, {}),
         ],
       }),
       hasActive && screen !== "now" && /* @__PURE__ */ jsx(MiniPlayer, {}),
@@ -174,30 +196,8 @@ export function Narrivox() {
     ],
   });
 }
-function Shelf({ userBooks, onAdd }) {
+function Shelf({ userBooks, onAdd, onSettings, onLibraryChanged, onRemove }) {
   const progress = usePlayer((state) => state.progress);
-  const [savingApk, setSavingApk] = useState(false);
-  async function downloadApk() {
-    setSavingApk(true);
-    try {
-      const response = await fetch("/Narrivox.apk");
-      if (!response.ok) return;
-      const bytes = await response.arrayBuffer();
-      const file = new File([bytes], "Narrivox.apk", {
-        type: "application/vnd.android.package-archive",
-      });
-      const url = URL.createObjectURL(file);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "Narrivox.apk";
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
-    } finally {
-      setSavingApk(false);
-    }
-  }
   const durations = usePlayer((state) => state.durations);
   const hydrated = usePlayer((state) => state.hydrated);
   const [query, setQuery] = useState("");
@@ -205,6 +205,11 @@ function Shelf({ userBooks, onAdd }) {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [opening, setOpening] = useState(null);
+  const searchingShelf = query.trim().length > 0;
+  useEffect(() => {
+    if (!searchingShelf) return;
+    return pushBackLayer(() => setQuery(""));
+  }, [searchingShelf]);
   const yours = userBooks.map(fromUser);
   const library = libraryShelf();
   const q = query.trim().toLowerCase();
@@ -300,10 +305,16 @@ function Shelf({ userBooks, onAdd }) {
                 children: [
                   /* @__PURE__ */ jsx("button", {
                     type: "button",
+                    className: "icon-btn",
+                    "aria-label": "Settings",
+                    onClick: onSettings,
+                    children: /* @__PURE__ */ jsx(Settings, { className: "h-5 w-5" }),
+                  }),
+                  /* @__PURE__ */ jsx("a", {
                     className: "btn btn-quiet shrink-0",
-                    onClick: () => void downloadApk(),
-                    disabled: savingApk,
-                    children: savingApk ? "Saving…" : "Download APK",
+                    href: "/Narrivox.apk",
+                    download: "Narrivox.apk",
+                    children: "Download APK",
                   }),
                   /* @__PURE__ */ jsxs("button", {
                     type: "button",
@@ -340,6 +351,7 @@ function Shelf({ userBooks, onAdd }) {
           }),
         ],
       }),
+      /* @__PURE__ */ jsx(StorageBanner, { onChange: onLibraryChanged }),
       q
         ? /* @__PURE__ */ jsxs("section", {
             children: [
@@ -356,6 +368,7 @@ function Shelf({ userBooks, onAdd }) {
                     books: results,
                     progress,
                     durations,
+                    onRemove,
                   }),
               /* @__PURE__ */ jsx("h2", {
                 className: "mt-8 text-xl",
@@ -479,7 +492,7 @@ function Shelf({ userBooks, onAdd }) {
                   }),
                   /* @__PURE__ */ jsx("p", {
                     className: "mt-1 text-sm text-muted",
-                    children: "Audio you add stays on this device.",
+                    children: "Audio you add is kept in the place chosen in Settings.",
                   }),
                   yours.length === 0 &&
                     /* @__PURE__ */ jsxs("button", {
@@ -503,6 +516,7 @@ function Shelf({ userBooks, onAdd }) {
                       books: yours,
                       progress,
                       durations,
+                      onRemove,
                     }),
                 ],
               }),
@@ -515,12 +529,13 @@ function Shelf({ userBooks, onAdd }) {
                   /* @__PURE__ */ jsx("p", {
                     className: "mt-1 text-sm text-muted",
                     children:
-                      "Full public-domain recordings from LibriVox. Playing one saves the whole book on this device.",
+                      "Full public-domain recordings from LibriVox. Playing one saves the whole book in your audiobook folder.",
                   }),
                   /* @__PURE__ */ jsx(BookGrid, {
                     books: library,
                     progress,
                     durations,
+                    onRemove,
                   }),
                 ],
               }),
@@ -529,53 +544,84 @@ function Shelf({ userBooks, onAdd }) {
     ],
   });
 }
-function BookGrid({ books, progress, durations }) {
+function BookGrid({ books, progress, durations, onRemove }) {
+  const [ask, setAsk] = useState(null);
   return /* @__PURE__ */ jsx("ul", {
     className:
       "mt-4 grid grid-cols-2 gap-x-4 gap-y-7 sm:grid-cols-3 lg:grid-cols-4",
     children: books.map((book) => {
       const fraction = listenedFraction(book, progress[book.id], durations);
       const finished = progress[book.id]?.finished;
-      return /* @__PURE__ */ jsx(
+      const confirming = ask === book.id;
+      return /* @__PURE__ */ jsxs(
         "li",
         {
-          children: /* @__PURE__ */ jsxs("button", {
-            type: "button",
-            className: "w-full text-left",
-            onClick: () => usePlayer.getState().openBook(book.id),
-            children: [
-              /* @__PURE__ */ jsx(CoverArt, {
-                title: book.title,
-                src: book.cover,
-              }),
-              /* @__PURE__ */ jsx("span", {
-                className: "mt-2 block font-display text-base leading-snug",
-                children: book.title,
-              }),
-              /* @__PURE__ */ jsx("span", {
-                className: "mt-0.5 block text-sm text-muted",
-                children: book.author,
-              }),
-              finished
-                ? /* @__PURE__ */ jsx("span", {
-                    className: "mt-1 block text-sm text-primary",
-                    children: "Finished",
-                  })
-                : fraction > 0.01 &&
-                  /* @__PURE__ */ jsx("span", {
-                    className: "bar mt-2 block",
-                    "aria-hidden": true,
-                    children: /* @__PURE__ */ jsx("span", {
-                      style: { width: `${Math.round(fraction * 100)}%` },
-                    }),
-                  }),
-              fraction > 0 &&
-                /* @__PURE__ */ jsxs("span", {
-                  className: "sr-only",
-                  children: [Math.round(fraction * 100), " percent played"],
+          children: [
+            /* @__PURE__ */ jsxs("button", {
+              type: "button",
+              className: "w-full text-left",
+              onClick: () => usePlayer.getState().openBook(book.id),
+              children: [
+                /* @__PURE__ */ jsx(CoverArt, {
+                  title: book.title,
+                  src: book.cover,
                 }),
-            ],
-          }),
+                /* @__PURE__ */ jsx("span", {
+                  className: "mt-2 block font-display text-base leading-snug",
+                  children: book.title,
+                }),
+                /* @__PURE__ */ jsx("span", {
+                  className: "mt-0.5 block text-sm text-muted",
+                  children: book.author,
+                }),
+                finished
+                  ? /* @__PURE__ */ jsx("span", {
+                      className: "mt-1 block text-sm text-primary",
+                      children: "Finished",
+                    })
+                  : fraction > 0.01 &&
+                    /* @__PURE__ */ jsx("span", {
+                      className: "bar mt-2 block",
+                      "aria-hidden": true,
+                      children: /* @__PURE__ */ jsx("span", {
+                        style: { width: `${Math.round(fraction * 100)}%` },
+                      }),
+                    }),
+                fraction > 0 &&
+                  /* @__PURE__ */ jsxs("span", {
+                    className: "sr-only",
+                    children: [Math.round(fraction * 100), " percent played"],
+                  }),
+              ],
+            }),
+            confirming
+              ? /* @__PURE__ */ jsxs("span", {
+                  className: "mt-2 flex flex-wrap gap-2",
+                  children: [
+                    /* @__PURE__ */ jsx("button", {
+                      type: "button",
+                      className: "btn btn-primary px-2 py-1 text-sm",
+                      onClick: () => {
+                        setAsk(null);
+                        void onRemove(book);
+                      },
+                      children: "Remove",
+                    }),
+                    /* @__PURE__ */ jsx("button", {
+                      type: "button",
+                      className: "btn btn-quiet px-2 py-1 text-sm",
+                      onClick: () => setAsk(null),
+                      children: "Cancel",
+                    }),
+                  ],
+                })
+              : /* @__PURE__ */ jsx("button", {
+                  type: "button",
+                  className: "btn btn-quiet mt-2 px-2 py-1 text-sm",
+                  onClick: () => setAsk(book.id),
+                  children: "Remove",
+                }),
+          ],
         },
         book.id,
       );
@@ -642,8 +688,14 @@ function BookScreen({ userBooks, onRemove }) {
   const activeId = usePlayer((state) => state.active?.bookId);
   const activeChapter = usePlayer((state) => state.active?.chapterId);
   const [confirming, setConfirming] = useState(false);
+  useEffect(() => {
+    return pushBackLayer(() => usePlayer.getState().closeBook());
+  }, []);
+  useEffect(() => {
+    if (!confirming) return;
+    return pushBackLayer(() => setConfirming(false));
+  }, [confirming]);
   const book = bookId ? findShelf(bookId, userBooks) : null;
-  const owned = userBooks.find((item) => item.id === bookId);
   if (!book)
     return /* @__PURE__ */ jsxs("main", {
       className: "mx-auto max-w-3xl px-5 py-6",
@@ -707,27 +759,56 @@ function BookScreen({ userBooks, onRemove }) {
                   className: "mt-3 text-pretty",
                   children: book.blurb,
                 }),
-              /* @__PURE__ */ jsx("div", {
-                className: "mt-4",
-                children: entry?.finished
-                  ? /* @__PURE__ */ jsxs("button", {
-                      type: "button",
-                      className: "btn btn-primary",
-                      onClick: () => void replay(book),
-                      children: [
-                        /* @__PURE__ */ jsx(Play, { className: "h-4 w-4" }),
-                        "Play again",
-                      ],
-                    })
-                  : /* @__PURE__ */ jsxs("button", {
-                      type: "button",
-                      className: "btn btn-primary",
-                      onClick: () => resume(book, entry),
-                      children: [
-                        /* @__PURE__ */ jsx(Play, { className: "h-4 w-4" }),
-                        entry ? "Resume" : "Play",
-                      ],
-                    }),
+              /* @__PURE__ */ jsxs("div", {
+                className: "mt-4 flex flex-wrap items-center gap-2",
+                children: [
+                  entry?.finished
+                    ? /* @__PURE__ */ jsxs("button", {
+                        type: "button",
+                        className: "btn btn-primary",
+                        onClick: () => void replay(book),
+                        children: [
+                          /* @__PURE__ */ jsx(Play, { className: "h-4 w-4" }),
+                          "Play again",
+                        ],
+                      })
+                    : /* @__PURE__ */ jsxs("button", {
+                        type: "button",
+                        className: "btn btn-primary",
+                        onClick: () => resume(book, entry),
+                        children: [
+                          /* @__PURE__ */ jsx(Play, { className: "h-4 w-4" }),
+                          entry ? "Resume" : "Play",
+                        ],
+                      }),
+                  confirming
+                    ? /* @__PURE__ */ jsxs(Fragment, {
+                        children: [
+                          /* @__PURE__ */ jsx("p", {
+                            className: "text-sm text-muted",
+                            children: "Remove this book from the library?",
+                          }),
+                          /* @__PURE__ */ jsx("button", {
+                            type: "button",
+                            className: "btn btn-primary",
+                            onClick: () => void onRemove(book),
+                            children: "Remove",
+                          }),
+                          /* @__PURE__ */ jsx("button", {
+                            type: "button",
+                            className: "btn btn-quiet",
+                            onClick: () => setConfirming(false),
+                            children: "Cancel",
+                          }),
+                        ],
+                      })
+                    : /* @__PURE__ */ jsx("button", {
+                        type: "button",
+                        className: "btn btn-quiet",
+                        onClick: () => setConfirming(true),
+                        children: "Remove from library",
+                      }),
+                ],
               }),
               book.source === "library" &&
                 /* @__PURE__ */ jsx(FullDownload, { bookId: book.id }),
@@ -828,38 +909,6 @@ function BookScreen({ userBooks, onRemove }) {
             }),
           ],
         }),
-      owned &&
-        /* @__PURE__ */ jsx("div", {
-          className: "mt-10",
-          children: confirming
-            ? /* @__PURE__ */ jsxs("div", {
-                className: "flex flex-wrap items-center gap-2",
-                children: [
-                  /* @__PURE__ */ jsx("p", {
-                    className: "text-sm text-muted",
-                    children: "Remove this copy from the device?",
-                  }),
-                  /* @__PURE__ */ jsx("button", {
-                    type: "button",
-                    className: "btn btn-primary",
-                    onClick: () => void onRemove(owned),
-                    children: "Remove",
-                  }),
-                  /* @__PURE__ */ jsx("button", {
-                    type: "button",
-                    className: "btn btn-quiet",
-                    onClick: () => setConfirming(false),
-                    children: "Cancel",
-                  }),
-                ],
-              })
-            : /* @__PURE__ */ jsx("button", {
-                type: "button",
-                className: "btn btn-quiet",
-                onClick: () => setConfirming(true),
-                children: "Remove from this device",
-              }),
-        }),
     ],
   });
 }
@@ -881,7 +930,7 @@ function FullDownload({ bookId }) {
   const fraction = total > 0 ? Math.min(1, status.received / total) : 0;
   const label =
     status.phase === "saved"
-      ? "Saved on this device"
+      ? "Saved"
       : status.phase === "saving"
         ? status.message
         : status.phase === "error"
@@ -1027,6 +1076,9 @@ function NowPlaying() {
   const [note, setNote] = useState(null);
   const [reading, setReading] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    return pushBackLayer(() => usePlayer.getState().closePlayer());
+  }, []);
   useEffect(() => {
     if (sleep.mode !== "minutes") return;
     const id = window.setInterval(() => setNow(Date.now()), 1e3);
