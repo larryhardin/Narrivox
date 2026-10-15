@@ -86,10 +86,22 @@ export function SettingsScreen({
   const [moving, setMoving] = useState<{ done: number; total: number } | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [version, setVersion] = useState("1.5.16");
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
   useEffect(() => pushBackLayer(() => onCloseRef.current()), []);
+
+  useEffect(() => {
+    const native = (window as unknown as { NightstandNative?: { appVersion?: () => string } })
+      .NightstandNative;
+    try {
+      const installed = native?.appVersion?.();
+      if (installed) setVersion(installed);
+    } catch {
+      // The page is open in a browser, so the fallback version stays.
+    }
+  }, []);
 
   async function reload() {
     setStatus(await storageStatus());
@@ -212,11 +224,9 @@ export function SettingsScreen({
       </section>
 
       <section className="mt-4 rounded-lg border border-border bg-raised p-4">
-        <h2 className="text-xl">Interface</h2>
-        <p className="mt-3 text-sm text-muted">
-          Swiping back on the home shelf leaves Narrivox running. The story keeps playing, and the
-          lock screen shows pause and the 15-second and 30-second skips.
-        </p>
+        <h2 className="text-xl">About</h2>
+        <p className="mt-3 text-sm text-muted">Narrivox</p>
+        <p className="mt-1">Version {version}</p>
       </section>
     </main>
   );

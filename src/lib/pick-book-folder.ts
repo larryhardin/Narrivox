@@ -1,6 +1,4 @@
-import { folderNameFromRelative, isDirectFolderFile } from "@/lib/folder-import";
-
-const AUDIO_NAME = /\.(mp3|m4a|aac|wav|ogg|flac|mpeg|mp4|webm|m4b)$/i;
+import { folderNameFromRelative, isChapterAudio, isDirectFolderFile } from "@/lib/folder-import";
 
 export type PickedFolder =
   | { ok: true; folderName: string; files: File[] }
@@ -29,14 +27,11 @@ function nativeFolder(): NativeFolder | null {
 }
 
 function isAudio(file: File) {
-  return file.type.startsWith("audio/") || file.type === "video/mp4" || AUDIO_NAME.test(file.name);
+  return isChapterAudio(file.name);
 }
 
 function mimeFor(name: string) {
-  if (/\.(m4a|m4b|mp4|aac)$/i.test(name)) return "audio/mp4";
-  if (/\.wav$/i.test(name)) return "audio/wav";
-  if (/\.ogg$/i.test(name)) return "audio/ogg";
-  if (/\.flac$/i.test(name)) return "audio/flac";
+  if (/\.m4a$/i.test(name)) return "audio/mp4";
   return "audio/mpeg";
 }
 

@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.View;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
 
@@ -19,6 +20,7 @@ public class MainActivity extends BridgeActivity {
 
     private boolean askedNotifications = false;
     private boolean storyOpen = false;
+    private boolean activityResumed = false;
     private FolderImport folderImport;
     private LibraryLocation libraryLocation;
 
@@ -47,6 +49,15 @@ public class MainActivity extends BridgeActivity {
             activity.runOnUiThread(
                 () -> activity.onPlaybackUpdated(title, artist, chapter, playing, positionMs, durationMs, cover)
             );
+        }
+
+        @JavascriptInterface
+        public String appVersion() {
+            try {
+                return activity.getPackageManager().getPackageInfo(activity.getPackageName(), 0).versionName;
+            } catch (Exception ignored) {
+                return "";
+            }
         }
 
         @JavascriptInterface
@@ -104,6 +115,7 @@ public class MainActivity extends BridgeActivity {
         folderImport = new FolderImport(this, () -> getBridge() == null ? null : getBridge().getWebView());
         libraryLocation = new LibraryLocation(this, () -> getBridge() == null ? null : getBridge().getWebView());
         PlaybackService.setSink(action -> deliverControl(action));
+        PlaybackService.setWakeHook(this::keepStoryAwake);
         if (getBridge() != null && getBridge().getWebView() != null) {
             getBridge().getWebView().addJavascriptInterface(new PlaybackBridge(this), "NightstandNative");
             getBridge().getWebView().addJavascriptInterface(new AppVault(this), "NarrivoxVault");
@@ -146,7 +158,14 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
+    public void onResume() {
+        super.onResume();
+        activityResumed = true;
+    }
+
+    @Override
     public void onPause() {
+        activityResumed = false;
         super.onPause();
         keepStoryAwake();
     }
@@ -155,10 +174,19 @@ public class MainActivity extends BridgeActivity {
     public void onStop() {
         super.onStop();
         keepStoryAwake();
+        WebView webView = getBridge() == null ? null : getBridge().getWebView();
+        if (webView == null) return;
+        webView.postDelayed(this::keepStoryAwake, 300);
+        webView.postDelayed(this::keepStoryAwake, 1200);
     }
 
     private void keepStoryAwake() {
         if (!storyOpen || externalUi) return;
+        wakeWebView();
+    }
+
+    private void wakeWebView() {
+        if (externalUi) return;
         WebView webView = getBridge() == null ? null : getBridge().getWebView();
         if (webView == null) return;
         if (Build.VERSION.SDK_INT >= 26) {
@@ -166,6 +194,7 @@ public class MainActivity extends BridgeActivity {
         }
         webView.onResume();
         webView.resumeTimers();
+        if (!activityResumed) webView.dispatchWindowVisibilityChanged(View.VISIBLE);
     }
 
     private void deliverControl(String action) {
@@ -174,25 +203,26 @@ public class MainActivity extends BridgeActivity {
         }
         WebView webView = getBridge() == null ? null : getBridge().getWebView();
         if (webView == null) return;
-        webView.post(() -> {
-            keepStoryAwake();
-            String js = "(function(){if(window.__narrivoxLock){window.__narrivoxLock('"
-                + action
-                + "');return 'ok';}return 'miss';})()";
-            webView.evaluateJavascript(js, value -> {
-                if (value != null && value.contains("miss")) {
-                    webView.postDelayed(() -> {
-                        keepStoryAwake();
-                        webView.evaluateJavascript(js, null);
-                    }, 180);
-                }
-            });
+        webView.post(() -> runControl(webView, action, 0));
+    }
+
+    private void runControl(WebView webView, String action, int attempt) {
+        wakeWebView();
+        String js = "(function(){if(window.__narrivoxLock){window.__narrivoxLock('"
+            + action
+            + "');return 'ok';}return 'miss';})()";
+        webView.evaluateJavascript(js, value -> {
+            if (value != null && !value.contains("miss")) return;
+            if (attempt >= 4) return;
+            webView.postDelayed(() -> runControl(webView, action, attempt + 1), 350L * (attempt + 1));
         });
     }
 
     @Override
     public void onDestroy() {
+        StoryWebView.keepPageAlive = false;
         PlaybackService.setSink(null);
+        PlaybackService.setWakeHook(null);
         stopService(new Intent(this, PlaybackService.class));
         super.onDestroy();
     }
@@ -208,6 +238,7 @@ public class MainActivity extends BridgeActivity {
     ) {
         boolean active = title != null && !title.isEmpty();
         storyOpen = active;
+        StoryWebView.keepPageAlive = active;
         if (!active) {
             stopService(new Intent(this, PlaybackService.class));
             return;

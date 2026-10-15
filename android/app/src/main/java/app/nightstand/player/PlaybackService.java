@@ -18,6 +18,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
@@ -34,7 +35,9 @@ import androidx.media.app.NotificationCompat.DecoratedMediaCustomViewStyle;
  */
 public class PlaybackService extends Service {
     static final String CHANNEL_ID = "narrivox-playback";
+    static final String LOCK_CHANNEL_ID = "narrivox-shelf";
     static final int NOTIFICATION_ID = 41;
+    static final int LOCK_NOTIFICATION_ID = 42;
 
     private static final String ACTION_PLAY = "narrivox.play";
     private static final String ACTION_PAUSE = "narrivox.pause";
@@ -43,6 +46,10 @@ public class PlaybackService extends Service {
 
     interface ControlSink {
         void onControl(String action);
+    }
+
+    interface WakeHook {
+        void keepAwake();
     }
 
     static final class Snapshot {
@@ -57,6 +64,7 @@ public class PlaybackService extends Service {
 
     private static PlaybackService instance;
     private static ControlSink sink;
+    private static WakeHook wake;
     private static Snapshot pending = new Snapshot();
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -68,6 +76,10 @@ public class PlaybackService extends Service {
 
     static void setSink(ControlSink next) {
         sink = next;
+    }
+
+    static void setWakeHook(WakeHook next) {
+        wake = next;
     }
 
     static void publish(
@@ -106,6 +118,17 @@ public class PlaybackService extends Service {
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.createNotificationChannel(channel);
 
+        NotificationChannel lock = new NotificationChannel(
+            LOCK_CHANNEL_ID,
+            "Playback controls",
+            NotificationManager.IMPORTANCE_DEFAULT
+        );
+        lock.setDescription("Play, pause, and skip from the notification shade and lock screen");
+        lock.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        lock.setSound(null, null);
+        lock.enableVibration(false);
+        if (manager != null) manager.createNotificationChannel(lock);
+
         session = new MediaSessionCompat(this, "Narrivox");
         session.setFlags(
             MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS
@@ -143,6 +166,7 @@ public class PlaybackService extends Service {
             wakeLock.setReferenceCounted(false);
             wakeLock.acquire(4 * 60 * 60 * 1000L);
         }
+        main.postDelayed(keepAlive, 10000);
     }
 
     @Override
@@ -160,6 +184,7 @@ public class PlaybackService extends Service {
 
     @Override
     public void onDestroy() {
+        main.removeCallbacks(keepAlive);
         if (instance == this) instance = null;
         if (session != null) {
             session.setActive(false);
@@ -167,6 +192,8 @@ public class PlaybackService extends Service {
         }
         art = null;
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) manager.cancel(LOCK_NOTIFICATION_ID);
         stopForeground(STOP_FOREGROUND_REMOVE);
         super.onDestroy();
     }
@@ -196,7 +223,8 @@ public class PlaybackService extends Service {
                 .setState(
                     state.playing ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED,
                     position,
-                    speed
+                    speed,
+                    SystemClock.elapsedRealtime()
                 )
                 .build();
             session.setPlaybackState(playback);
@@ -239,6 +267,7 @@ public class PlaybackService extends Service {
                     startForeground(NOTIFICATION_ID, notification);
                 }
                 foreground = true;
+                postLock(state);
             } catch (Exception error) {
                 stopSelf();
             }
@@ -246,6 +275,12 @@ public class PlaybackService extends Service {
         }
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.notify(NOTIFICATION_ID, notification);
+        postLock(state);
+    }
+
+    private void postLock(Snapshot state) {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) manager.notify(LOCK_NOTIFICATION_ID, buildLock(state));
     }
 
     private Notification build(Snapshot state) {
@@ -280,7 +315,7 @@ public class PlaybackService extends Service {
             .setColorized(true)
             .setContentIntent(activityIntent(openIntent(), 4))
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setOngoing(state.playing)
+            .setOngoing(true)
             .setSilent(true)
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_TRANSPORT)
@@ -294,6 +329,37 @@ public class PlaybackService extends Service {
                     .setMediaSession(session.getSessionToken())
                     .setShowActionsInCompactView(0, 1, 2)
             )
+            .build();
+    }
+
+    private Notification buildLock(Snapshot state) {
+        NotificationCompat.Action back = new NotificationCompat.Action.Builder(
+            controlIcon("back"),
+            "Back 15 seconds",
+            serviceIntent(ACTION_BACK, 11)
+        ).build();
+        NotificationCompat.Action toggle = state.playing
+            ? new NotificationCompat.Action.Builder(controlIcon("pause"), "Pause", serviceIntent(ACTION_PAUSE, 12)).build()
+            : new NotificationCompat.Action.Builder(controlIcon("play"), "Play", serviceIntent(ACTION_PLAY, 12)).build();
+        NotificationCompat.Action forward = new NotificationCompat.Action.Builder(
+            controlIcon("forward"),
+            "Forward 30 seconds",
+            serviceIntent(ACTION_FORWARD, 13)
+        ).build();
+        return new NotificationCompat.Builder(this, LOCK_CHANNEL_ID)
+            .setContentTitle(state.title)
+            .setContentText(state.chapter)
+            .setSubText(state.artist.isEmpty() ? "Narrivox" : state.artist)
+            .setSmallIcon(R.drawable.ic_stat_n)
+            .setContentIntent(activityIntent(openIntent(), 14))
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .addAction(back)
+            .addAction(toggle)
+            .addAction(forward)
             .build();
     }
 
@@ -475,6 +541,41 @@ public class PlaybackService extends Service {
             }
         }
         if (!line.isEmpty() && drawn < 3) canvas.drawText(line, x, y, paint);
+    }
+
+    private final Runnable keepAlive = new Runnable() {
+        @Override
+        public void run() {
+            if (instance != PlaybackService.this) return;
+            if (pending.title != null && !pending.title.isEmpty() && !pending.playing) refreshPaused();
+            WakeHook hook = wake;
+            if (hook != null && pending.title != null && !pending.title.isEmpty()) hook.keepAwake();
+            main.postDelayed(this, 5000);
+        }
+    };
+
+    private void refreshPaused() {
+        if (session == null || foreground == false) return;
+        int position = pending.positionMs;
+        if (pending.durationMs > 0 && position >= pending.durationMs) position = Math.max(0, pending.durationMs - 1);
+        session.setPlaybackState(
+            new PlaybackStateCompat.Builder()
+                .setActions(
+                    PlaybackStateCompat.ACTION_PLAY
+                        | PlaybackStateCompat.ACTION_PAUSE
+                        | PlaybackStateCompat.ACTION_PLAY_PAUSE
+                        | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+                        | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+                )
+                .setState(PlaybackStateCompat.STATE_PAUSED, position, 0f, SystemClock.elapsedRealtime())
+                .build()
+        );
+        session.setActive(true);
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) {
+            manager.notify(NOTIFICATION_ID, build(pending));
+            manager.notify(LOCK_NOTIFICATION_ID, buildLock(pending));
+        }
     }
 
     private long lastDispatchAt = 0;

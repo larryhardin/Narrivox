@@ -23,7 +23,8 @@ function runRemoteControl(action: string) {
   const now = Date.now();
   const toggle = action === "play" || action === "pause";
   const lastToggle = lastControl === "play" || lastControl === "pause";
-  if (now - lastControlAt < 400 && (action === lastControl || (toggle && lastToggle))) return;
+  if (action === lastControl && now - lastControlAt < 1200) return;
+  if (toggle && lastToggle && action !== lastControl && now - lastControlAt < 400) return;
   lastControl = action;
   lastControlAt = now;
   const audio = getAudio();
@@ -233,23 +234,39 @@ export function AudioEngine() {
       return;
     }
     const nativeControls = "NightstandNative" in window;
-    if (!nativeControls) {
-      const artwork = cover
-        ? [
-            {
-              src: new URL(cover, window.location.origin).href,
-              sizes: "1152x1728",
-              type: "image/jpeg",
-            },
-          ]
-        : [];
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: chapterTitle || title,
-        artist: author,
-        album: title,
-        artwork,
-      });
+    if (nativeControls) {
+      const names = ["play", "pause", "previoustrack", "nexttrack", "seekbackward", "seekforward"] as const;
+      for (const name of names) {
+        try {
+          navigator.mediaSession.setActionHandler(name, null);
+        } catch {
+          // This action is not supported here.
+        }
+      }
+      try {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = "none";
+      } catch {
+        // The native player owns the lock screen.
+      }
+      syncNativePlayback();
+      return;
     }
+    const artwork = cover
+      ? [
+          {
+            src: new URL(cover, window.location.origin).href,
+            sizes: "1152x1728",
+            type: "image/jpeg",
+          },
+        ]
+      : [];
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: chapterTitle || title,
+      artist: author,
+      album: title,
+      artwork,
+    });
     const bind = (name: MediaSessionAction, action: () => void) => {
       try {
         navigator.mediaSession.setActionHandler(name, action);

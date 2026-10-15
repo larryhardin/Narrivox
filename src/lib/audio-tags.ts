@@ -3,6 +3,7 @@ export type AudioTags = {
   artist?: string;
   albumArtist?: string;
   album?: string;
+  track?: number;
   picture?: Blob;
 };
 
@@ -35,6 +36,14 @@ function ascii(bytes: Uint8Array, offset: number, length: number) {
 
 function clean(value: string) {
   return value.replace(/\0/g, "").trim();
+}
+
+export function trackFromText(value: string) {
+  const match = clean(value).match(/^0*(\d+)(?:\s*(?:\/|of)\s*\d+)?$/i);
+  if (!match) return;
+  const number = Number(match[1]);
+  if (!Number.isInteger(number) || number < 1 || number > 9999) return;
+  return number;
 }
 
 function decodeText(bytes: Uint8Array) {
@@ -107,7 +116,10 @@ function parseId3(bytes: Uint8Array, version: number): AudioTags {
     else if (id === "TPE1" || id === "TP1") tags.artist = decodeText(frame);
     else if (id === "TPE2" || id === "TP2") tags.albumArtist = decodeText(frame);
     else if (id === "TALB" || id === "TAL") tags.album = decodeText(frame);
-    else if ((id === "APIC" || id === "PIC") && !tags.picture) tags.picture = readApic(frame);
+    else if (id === "TRCK" || id === "TRK") {
+      const track = trackFromText(decodeText(frame));
+      if (track) tags.track = track;
+    } else if ((id === "APIC" || id === "PIC") && !tags.picture) tags.picture = readApic(frame);
     offset = end;
   }
   return tags;
@@ -118,7 +130,10 @@ function parseId3v1(bytes: Uint8Array): AudioTags {
   const start = bytes.length - 128;
   const slice = (from: number, length: number) =>
     clean(new TextDecoder("latin1").decode(bytes.subarray(start + from, start + from + length)));
-  return { title: slice(3, 30), artist: slice(33, 30), album: slice(63, 30) };
+  const tags = { title: slice(3, 30), artist: slice(33, 30), album: slice(63, 30) };
+  const track = bytes[start + 126] ?? 0;
+  if (bytes[start + 125] === 0 && track >= 1 && track <= 255) return { ...tags, track };
+  return tags;
 }
 
 function atomWalk(
@@ -163,7 +178,15 @@ function parseIlst(bytes: Uint8Array, start: number, end: number): AudioTags {
     else if (type === "\u00a9ART") tags.artist = text();
     else if (type === "aART") tags.albumArtist = text();
     else if (type === "\u00a9alb") tags.album = text();
-    else if (type === "covr" && !tags.picture) {
+    else if (type === "trkn") {
+      if (kind === 1) {
+        const track = trackFromText(text());
+        if (track) tags.track = track;
+      } else if (value.length >= 4) {
+        const track = (value[2]! << 8) | value[3]!;
+        if (track >= 1 && track <= 9999) tags.track = track;
+      }
+    } else if (type === "covr" && !tags.picture) {
       const mime = kind === 14 ? "image/png" : "image/jpeg";
       if (value.length > 32) {
         const copy = new Uint8Array(value.byteLength);
@@ -210,7 +233,7 @@ export async function readAudioTags(file: Blob): Promise<AudioTags> {
     const tagSize = syncsafe(head, 6);
     const body = await readSlice(file, 10, 10 + Math.min(tagSize, 8_000_000));
     const tags = parseId3(body, version);
-    if (tags.title || tags.album || tags.picture) return tags;
+    if (tags.title || tags.album || tags.picture || tags.artist || tags.track) return tags;
   }
   const brand = await readSlice(file, 0, Math.min(file.size, 12));
   if (brand.length >= 8 && ascii(brand, 4, 4) === "ftyp") {
@@ -236,7 +259,7 @@ export async function readAudioTags(file: Blob): Promise<AudioTags> {
     if (moov && moov.size > 0 && moov.size <= 12_000_000) {
       const box = await readSlice(file, moov.at, moov.at + moov.size);
       const tags = parseMp4(box);
-      if (tags.title || tags.album || tags.picture || tags.artist) return tags;
+      if (tags.title || tags.album || tags.picture || tags.artist || tags.track) return tags;
     }
   }
   if (file.size >= 128) {

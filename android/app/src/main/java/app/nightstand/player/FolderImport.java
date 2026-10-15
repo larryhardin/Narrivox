@@ -238,18 +238,9 @@ final class FolderImport {
     }
 
     private static boolean isAudio(String name, String mime) {
-        if (mime != null && mime.startsWith("audio/")) return true;
         if (name == null) return false;
         String lower = name.toLowerCase();
-        return lower.endsWith(".mp3")
-            || lower.endsWith(".m4a")
-            || lower.endsWith(".m4b")
-            || lower.endsWith(".aac")
-            || lower.endsWith(".wav")
-            || lower.endsWith(".ogg")
-            || lower.endsWith(".flac")
-            || lower.endsWith(".mp4")
-            || lower.endsWith(".mpeg");
+        return lower.endsWith(".mp3") || lower.endsWith(".m4a");
     }
 
     private void notifyProgress(int done, int total) {

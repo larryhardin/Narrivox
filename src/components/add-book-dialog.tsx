@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { ChevronDown, ChevronUp, Plus, X } from "lucide-react";
+import { ChevronDown, ChevronUp, ImageIcon, Plus, X } from "lucide-react";
 import { CoverArt } from "@/components/cover";
 import { pushBackLayer } from "@/lib/back-stack";
 import { readAudioTags, titleFromFilename } from "@/lib/audio-tags";
@@ -68,6 +68,8 @@ export function AddBookDialog({
   const [narrator, setNarrator] = useState("");
   const [cover, setCover] = useState("");
   const [coverFromFile, setCoverFromFile] = useState(false);
+  const [coverKind, setCoverKind] = useState<"audio" | "catalog" | "own" | null>(null);
+  const ownCover = useRef(false);
   const [files, setFiles] = useState<File[]>([]);
   const [hits, setHits] = useState<BookHit[]>([]);
   const [looking, setLooking] = useState(false);
@@ -95,6 +97,8 @@ export function AddBookDialog({
     setNarrator("");
     setCover("");
     setCoverFromFile(false);
+    setCoverKind(null);
+    ownCover.current = false;
     setFiles([]);
     setHits([]);
     setLooking(false);
@@ -145,16 +149,17 @@ export function AddBookDialog({
         const guessedAuthor = tags.albumArtist || tags.artist || "";
         setTitle((current) => current || guessed);
         setAuthor((current) => current || guessedAuthor);
-        if (tags.picture) {
+        if (tags.picture && !ownCover.current) {
           let dataUrl = "";
           try {
             dataUrl = await shrinkCover(tags.picture);
           } catch {
             dataUrl = await blobToDataUrl(tags.picture);
           }
-          if (cancel) return;
+          if (cancel || ownCover.current) return;
           setCover(dataUrl);
           setCoverFromFile(true);
+          setCoverKind("audio");
           setNote("Cover found inside the file. The title is matched against Audible and other catalogs.");
           return;
         }
@@ -174,17 +179,52 @@ export function AddBookDialog({
     setAuthor(hit.author);
     if (hit.year) setYear(hit.year);
     if (hit.narrator) setNarrator(hit.narrator);
-    if (!coverFromFile && hit.cover) setCover(hit.cover);
+    if (!ownCover.current && !coverFromFile && hit.cover) {
+      setCover(hit.cover);
+      setCoverKind("catalog");
+    }
     setHits([]);
     setNote(`Using ${hit.source}.`);
+  }
+
+  async function useOwnCover(file: File | undefined) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("Choose an image for the cover.");
+      return;
+    }
+    try {
+      const dataUrl = await shrinkCover(file);
+      ownCover.current = true;
+      setCover(dataUrl);
+      setCoverFromFile(true);
+      setCoverKind("own");
+      setError(null);
+    } catch {
+      setError("That image couldn't be used.");
+    }
   }
 
   function chapterLabel(file: File, index: number) {
     return chapterTitleFor(file.name) || prettyName(file.name, index);
   }
 
-  function useFolder(folderName: string, audio: File[]) {
-    const ordered = orderFolderAudio(folderName, audio.map((file) => file.name));
+  async function useFolder(folderName: string, audio: File[]) {
+    setNote(audio.length > 1 ? "Reading chapter numbers…" : "");
+    const tracks = await Promise.all(
+      audio.map(async (file) => {
+        try {
+          const tags = await readAudioTags(file);
+          return tags.track ?? null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const ordered = orderFolderAudio(
+      folderName,
+      audio.map((file, index) => ({ name: file.name, track: tracks[index] })),
+    );
     if (!ordered.ok) {
       setError(ordered.error);
       setNote("");
@@ -219,7 +259,7 @@ export function AddBookDialog({
         if (!picked.cancelled && picked.error) setError(picked.error);
         return;
       }
-      useFolder(picked.folderName || "Audiobook", picked.files);
+      await useFolder(picked.folderName || "Audiobook", picked.files);
     } catch {
       setError("That folder couldn't be read.");
     } finally {
@@ -298,16 +338,36 @@ export function AddBookDialog({
           <Dialog.Description className="mt-2 text-sm text-muted">
             Audio is saved in the place you chose in Settings. Choose a folder when the audio files inside it are the chapters of one book. The title is looked up on Audible and other public catalogs.
           </Dialog.Description>
-          {cover && (
-            <div className="mt-4 flex items-center gap-3">
-              <div className="w-16 shrink-0">
-                <CoverArt title={title || "Book"} src={cover} />
-              </div>
-              <p className="text-sm text-muted">
-                {coverFromFile ? "Cover taken from the audio file." : "Cover from the catalog match."}
-              </p>
+          <div className="mt-4 flex items-center gap-3">
+            <div className="w-16 shrink-0">
+              <CoverArt title={title || "Book"} src={cover || undefined} />
             </div>
-          )}
+            <div className="min-w-0">
+              <label className="btn btn-quiet cursor-pointer">
+                <ImageIcon className="h-4 w-4" />
+                Choose cover
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="sr-only"
+                  onChange={(event) => {
+                    const picked = event.target.files?.[0];
+                    event.target.value = "";
+                    void useOwnCover(picked);
+                  }}
+                />
+              </label>
+              {cover && (
+                <p className="mt-2 text-sm text-muted">
+                  {coverKind === "own"
+                    ? "Your cover."
+                    : coverKind === "audio"
+                      ? "Cover taken from the audio file."
+                      : "Cover from the catalog match."}
+                </p>
+              )}
+            </div>
+          </div>
           <label className="mt-5 block text-sm text-muted" htmlFor="book-title">
             Title
           </label>
@@ -404,12 +464,12 @@ export function AddBookDialog({
                   if (!direct.folderName || direct.files.length === 0) {
                     setError(
                       direct.folderName
-                        ? "This folder has no audio files."
+                        ? "This folder has no mp3 or m4a files."
                         : "That folder couldn't be read.",
                     );
                     return;
                   }
-                  useFolder(direct.folderName, direct.files);
+                  void useFolder(direct.folderName, direct.files);
                 }}
               />
             </label>
